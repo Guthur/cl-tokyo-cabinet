@@ -17,6 +17,8 @@
 
 (in-package :tokyo-cabinet)
 
+(declaim (optimize speed))
+
 (deftype int32 ()
   "The 32bit built-in DBM key type."
   '(signed-byte 32))
@@ -38,7 +40,7 @@
          :initarg :text
          :reader text))
   (:report (lambda (condition stream)
-             (format stream "DBM error (~a) ~a~@[: ~a~]."
+             (format stream "DBM error (~A) ~A~@[: ~A~]."
                      (error-code-of condition)
                      (error-msg-of condition)
                      (text condition)))))
@@ -46,8 +48,43 @@
 (defclass tc-dbm ()
   ((ptr :initarg :ptr
         :accessor ptr-of
-        :documentation "A pointer to a TC native database object."))
+        :documentation "A pointer to a TC native database object.")
+   (foreign-key-str :initform (foreign-alloc :char :count 128)
+		    :accessor foreign-key-str)
+   (foreign-val-str :initform (foreign-alloc :char :count 128)
+		    :accessor foreign-val-str)
+   (flag :initform (foreign-string-alloc "%d")
+	 :reader get-flag)
+   (codec :reader codec))
   (:documentation "A TC database."))
+
+(defmethod initialize-instance :after ((db tc-dbm) &key 
+				       (encoding *default-foreign-encoding*))
+  (setf (slot-value db 'codec) (make-instance 'codec :encoding encoding)))
+
+(defclass codec ()
+  ((nul-len :reader nul-len)
+   (mapping :reader mapping)
+   (encoder :reader encoder)
+   (decoder :reader decoder)
+   (oct-counter :reader oct-counter)
+   (code-point-counter :reader-code-point-counter))
+  (:documentation "Database string codec"))
+
+(defmethod initialize-instance :after ((codec codec) &key 
+				       (encoding *default-foreign-encoding*))
+  (setf (slot-value codec 'nul-len) 
+	(cffi::null-terminator-len encoding))
+  (setf (slot-value codec 'mapping)
+	(cffi::lookup-mapping cffi::*foreign-string-mappings* encoding))
+  (setf (slot-value codec 'oct-counter) 
+	(cffi::octet-counter (slot-value codec 'mapping)))
+  (setf (slot-value codec 'encoder) 
+	(babel::encoder (slot-value codec 'mapping)))
+  (setf (slot-value codec 'decoder) 
+	(babel::decoder (slot-value codec 'mapping)))
+  (setf (slot-value codec 'code-point-counter)
+	(babel::code-point-counter (slot-value codec 'mapping))))
 
 (defclass tc-bdb (tc-dbm)
   ()
@@ -194,6 +231,17 @@ NIL ."))
        (when ,var
          (iter-close ,var)))))
 
+(declaim (inline validate-open-mode
+		 get-string->string
+		 get-int32->string
+		 get-string->octets
+		 get-int32->octets
+		 put-string->string
+		 put-int32->string
+		 put-string->octets
+		 put-int32->octets))		 
+
+(declaim (ftype (function (list) boolean) validate-open-mode))
 (defun validate-open-mode (mode)
   (cond ((and (member :create mode)
               (not (member :write mode)))
@@ -205,18 +253,22 @@ NIL ."))
                 "The :TRUNCATE argument may not be used in :READ mode"))
         (t t)))
 
+(declaim (ftype (function (tc-dbm string function)) get-string->string))
 (defun get-string->string (db key fn)
+  (declare (type function fn))
   (let ((value-ptr nil))
     (unwind-protect
          (progn
            (setf value-ptr (funcall fn (ptr-of db) key))
            (if (null-pointer-p value-ptr)
                (maybe-raise-error db (format nil "(key ~a)" key))
-             (foreign-string-to-lisp value-ptr)))
+	       (db-str->cl-str (codec db) value-ptr)))
       (when (and value-ptr (not (null-pointer-p value-ptr)))
         (foreign-string-free value-ptr)))))
 
+(declaim (ftype (function (tc-dbm string function) (vector (unsigned-byte 8))) get-string->octets))
 (defun get-string->octets (db key fn)
+  (declare (type function fn))
   "Note that for the key we allocate a foreign string that is not
 null-terminated."
   (let ((value-ptr nil))
@@ -231,24 +283,33 @@ null-terminated."
       (when (and value-ptr (not (null-pointer-p value-ptr)))
         (foreign-string-free value-ptr)))))
 
+(declaim (ftype (function (tc-dbm int32 function)) get-int32->string))
 (defun get-int32->string (db key fn)
-  (declare (type int32 key))
-  (let ((key-len (foreign-type-size :int32))
-        (value-ptr nil))
+  (declare (type function fn))
+  (let ((value-ptr nil))
+    (foreign-funcall "sprintf" 
+		     :pointer (foreign-key-str db) 
+		     :pointer (get-flag db) 
+		     :int key 
+		     :void)
     (unwind-protect
-         (with-foreign-objects ((key-ptr :int32)
-                                (size-ptr :int))
-           (setf (mem-ref key-ptr :int32) key
-                 value-ptr (funcall fn (ptr-of db) key-ptr key-len size-ptr))
+         (with-foreign-objects ((size-ptr :int))
+           (setf value-ptr 
+		 (funcall fn 
+			  (ptr-of db) 
+			  (foreign-key-str db) 
+			  (foreign-funcall "strlen" 
+					   :pointer (foreign-key-str db) :int) 
+			  size-ptr))
            (if (null-pointer-p value-ptr)
                (maybe-raise-error db (format nil "(key ~a)" key))
-             (foreign-string-to-lisp value-ptr
-                                     :count (mem-ref size-ptr :int))))
+	       (db-str->cl-str (codec db) value-ptr)))
       (when (and value-ptr (not (null-pointer-p value-ptr)))
         (foreign-string-free value-ptr)))))
 
+(declaim (ftype (function (tc-dbm int32 function)) get-int32->octets))
 (defun get-int32->octets (db key fn)
-  (declare (type int32 key))
+  (declare (type function fn))
   (let ((key-len (foreign-type-size :int32))
         (value-ptr nil))
     (unwind-protect
@@ -262,61 +323,96 @@ null-terminated."
       (when (and value-ptr (not (null-pointer-p value-ptr)))
         (foreign-string-free value-ptr)))))
 
-(defun put-string->string (db key value fn)
-  (or (funcall fn (ptr-of db) key value)
+(declaim (ftype (function (tc-dbm string string function)) 
+		put-string->string))
+(defun put-string->string (db key value fn)  
+  (declare (type function fn))
+  (or (funcall fn (ptr-of db) 
+	       (cl-str->db-str (codec db)
+			       key
+			       (foreign-key-str db) 
+			       (1+ (length key)))
+	       (cl-str->db-str (codec db)
+			       value
+			       (foreign-val-str db) 
+			       (1+ (length value))))
       (maybe-raise-error db (format nil "(key ~a) (value ~a)" key value))))
 
+(declaim (ftype (function (tc-dbm string (vector (unsigned-byte 8)) function))
+		put-string->octets))
 (defun put-string->octets (db key value fn)
   "Note that for the key we allocate a foreign string that is not
 null-terminated."
-  (declare (type (vector (unsigned-byte 8)) value))
+  (declare (type function fn))
   (let ((value-len (length value)))
     (with-foreign-string ((key-ptr key-len) key :null-terminated-p nil)
       (with-foreign-object (value-ptr :unsigned-char value-len)
         (loop
            for i from 0 below value-len
-           do (setf (mem-aref value-ptr :unsigned-char i) (aref value i)))
+           do (setf (mem-aref value-ptr :unsigned-char i) (aref value i))
+	      (print (aref value i)))
         (or (funcall fn (ptr-of db) key-ptr key-len value-ptr value-len)
             (maybe-raise-error db (format nil "(key ~a) (value ~a)"
                                           key value)))))))
 
+(declaim (ftype (function (tc-dbm int32 string function)) 
+		put-int32->string))
 (defun put-int32->string (db key value fn)
-  (declare (type int32 key))
-  (let ((key-len (foreign-type-size :int32))
-        (value-len (length value)))
-    (with-foreign-object (key-ptr :int32)
-      (setf (mem-ref key-ptr :int32) key)
-      (with-foreign-string (value-ptr value)
-        (or (funcall fn (ptr-of db) key-ptr key-len value-ptr value-len)
-            (maybe-raise-error db (format nil "(key ~a) (value ~a)"
-                                          key value)))))))
+  (declare (type function fn))
+  (foreign-funcall "sprintf" 
+		   :pointer (foreign-key-str db) 
+		   :pointer (get-flag db) 
+		   :int key 
+		   :void)
+  (cl-str->db-str (codec db)
+		  value
+		  (foreign-val-str db) 
+		  (1+ (length value)))
+  (or (funcall fn 
+	       (ptr-of db) 
+	       (foreign-key-str db) 
+	       (foreign-funcall "strlen" :pointer (foreign-key-str db) :int)
+	       (foreign-val-str db) 
+	       (length value))
+      (maybe-raise-error db (format nil "(key ~a) (value ~a)"
+				    key value))))
 
+(declaim (ftype (function (tc-dbm int32 (vector (unsigned-byte 8)) function))
+		put-int32->octets))
 (defun put-int32->octets (db key value fn)
-  (declare (type int32 key)
-           (type (vector (unsigned-byte 8)) value))
-  (let ((key-len (foreign-type-size :int32))
-        (value-len (length value)))
-    (with-foreign-objects ((key-ptr :int32)
-                           (value-ptr :unsigned-char value-len))
-      (setf (mem-ref key-ptr :int32) key)
+  (declare (type function fn))
+  (let ((value-len (length value)))
+    (foreign-funcall "sprintf" 
+		     :pointer (foreign-key-str db) 
+		     :pointer (get-flag db) 
+		     :int key 
+		     :void)
+    (with-foreign-objects ((value-ptr :unsigned-char value-len))      
       (loop
-         for i from 0 below value-len
-         do (setf (mem-aref value-ptr :unsigned-char i) (aref value i)))
-      (or (funcall fn (ptr-of db) key-ptr key-len value-ptr value-len)
-        (maybe-raise-error db (format nil "(key ~a) (value ~a)"
-                                      key value))))))
+	for i from 0 below value-len
+	do (setf (mem-aref value-ptr :unsigned-char i) (elt value i)))
+      (or (funcall fn 
+		   (ptr-of db) 
+		   (foreign-key-str db) 
+		   (foreign-funcall "strlen" :pointer (foreign-key-str db) :int)
+		   value-ptr 
+		   value-len)
+	  (maybe-raise-error db (format nil "(key ~a) (value ~a)"
+					key value))))))
 
 (defun rem-string->value (db key fn)
+  (declare (type function fn))
   (or (funcall fn (ptr-of db) key)
       (maybe-raise-error db (format nil "(key ~a)" key))))
 
 (defun rem-string->duplicates (db key fn)
+  (declare (type function fn))
   (with-foreign-string ((key-ptr key-len) key :null-terminated-p nil)
     (or (funcall fn (ptr-of db) key key-len)
         (maybe-raise-error db (format nil "(key ~a)" key)))))
 
 (defun rem-int32->value (db key fn)
-  (declare (type int32 key))
+  (declare (type function fn))
   (with-foreign-object (key-ptr :int32)
     (setf (mem-ref key-ptr :int32) key)
     (or (funcall fn (ptr-of db) key-ptr (foreign-type-size :int32))

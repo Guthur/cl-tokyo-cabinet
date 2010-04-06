@@ -40,15 +40,18 @@
                           :pathname "src/"
                           :components
                           ((:file "package")
-                           (:file "tokyo-cabinet-ffi"
+                           (:file "tokyo-cabinet-ffi"			  
+                                  :depends-on ("package"))
+			   (:file "util"			  
                                   :depends-on ("package"))
                            (:file "tokyo-cabinet"
                                   :depends-on ("package"
-                                               "tokyo-cabinet-ffi"))
+                                               "tokyo-cabinet-ffi"
+					       "util"))
                            (:file "tokyo-cabinet-bdb"
                                   :depends-on ("package"
                                                "tokyo-cabinet-ffi"
-                                               "tokyo-cabinet"))
+                                               "tokyo-cabinet")
                            (:file "tokyo-cabinet-hdb"
                                   :depends-on ("package"
                                                "tokyo-cabinet-ffi"

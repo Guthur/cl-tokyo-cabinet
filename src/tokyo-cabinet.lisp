@@ -68,7 +68,7 @@
    (encoder :reader encoder)
    (decoder :reader decoder)
    (oct-counter :reader oct-counter)
-   (code-point-counter :reader-code-point-counter))
+   (code-point-counter :reader code-point-counter))
   (:documentation "Database string codec"))
 
 (defmethod initialize-instance :after ((codec codec) &key 
